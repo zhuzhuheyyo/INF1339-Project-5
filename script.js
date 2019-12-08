@@ -1,175 +1,179 @@
 console.log('Hello TensorFlow');
-/**
- * Get the car data reduced to just the variables we are interested
- * and cleaned of missing data.
- */
-async function getData() {
-  const carsDataReq = await fetch('https://storage.googleapis.com/tfjs-tutorials/carsData.json');  
-  const carsData = await carsDataReq.json();  
-  const cleaned = carsData.map(car => ({
-    mpg: car.Miles_per_Gallon,
-    horsepower: car.Horsepower,
-  }))
-  .filter(car => (car.mpg != null && car.horsepower != null));
+
+import {MnistData} from './data.js';
+
+async function showExamples(data) {
+  // Create a container in the visor
+  const surface =
+    tfvis.visor().surface({ name: 'Input Data Examples', tab: 'Input Data'});  
+
+  // Get the examples
+  const examples = data.nextTestBatch(20);
+  const numExamples = examples.xs.shape[0];
   
-  return cleaned;
+  // Create a canvas element to render each example
+  for (let i = 0; i < numExamples; i++) {
+    const imageTensor = tf.tidy(() => {
+      // Reshape the image to 28x28 px
+      return examples.xs
+        .slice([i, 0], [1, examples.xs.shape[1]])
+        .reshape([28, 28, 1]);
+    });
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = 28;
+    canvas.height = 28;
+    canvas.style = 'margin: 4px;';
+    await tf.browser.toPixels(imageTensor, canvas);
+    surface.drawArea.appendChild(canvas);
+
+    imageTensor.dispose();
+  }
 }
-async function run() {
-  // Load and plot the original input data that we are going to train on.
-  const data = await getData();
-  const values = data.map(d => ({
-    x: d.horsepower,
-    y: d.mpg,
-  }));
 
-  tfvis.render.scatterplot(
-    {name: 'Horsepower v MPG'},
-    {values}, 
-    {
-      xLabel: 'Horsepower',
-      yLabel: 'MPG',
-      height: 300
-    }
-  );
-
-  // More code will be added below
-    const model = createModel();  
-    tfvis.show.modelSummary({name: 'Model Summary'}, model);
+async function run() {  
+  const data = new MnistData();
+  await data.load();
+  await showExamples(data);
     
-    // Convert the data to a form we can use for training.
-    const tensorData = convertToTensor(data);
-    const {inputs, labels} = tensorData;
+    const model = getModel();
+    tfvis.show.modelSummary({name: 'Model Architecture'}, model);
+  
+    await train(model, data);
     
-    // Train the model  
-    await trainModel(model, inputs, labels);
-    console.log('Done Training');
-    
-    // Make some predictions using the model and compare them to the
-    // original data
-    testModel(model, data, tensorData);
-
+    await showAccuracy(model, data);
+    await showConfusion(model, data);
 }
 
 document.addEventListener('DOMContentLoaded', run);
 
-function createModel() {
-  // Create a sequential model
-  const model = tf.sequential(); 
+function getModel() {
+  const model = tf.sequential();
   
-  // Add a single hidden layer
-  model.add(tf.layers.dense({inputShape: [1], units: 1, useBias: true}));
+  const IMAGE_WIDTH = 28;
+  const IMAGE_HEIGHT = 28;
+  const IMAGE_CHANNELS = 1;  
   
-  // Add an output layer
-  model.add(tf.layers.dense({units: 1, useBias: true}));
+  // In the first layer of our convolutional neural network we have 
+  // to specify the input shape. Then we specify some parameters for 
+  // the convolution operation that takes place in this layer.
+  model.add(tf.layers.conv2d({
+    inputShape: [IMAGE_WIDTH, IMAGE_HEIGHT, IMAGE_CHANNELS],
+    kernelSize: 5,
+    filters: 8,
+    strides: 1,
+    activation: 'relu',
+    kernelInitializer: 'varianceScaling'
+  }));
+
+  // The MaxPooling layer acts as a sort of downsampling using max values
+  // in a region instead of averaging.  
+  model.add(tf.layers.maxPooling2d({poolSize: [2, 2], strides: [2, 2]}));
+  
+  // Repeat another conv2d + maxPooling stack. 
+  // Note that we have more filters in the convolution.
+  model.add(tf.layers.conv2d({
+    kernelSize: 5,
+    filters: 16,
+    strides: 1,
+    activation: 'relu',
+    kernelInitializer: 'varianceScaling'
+  }));
+  model.add(tf.layers.maxPooling2d({poolSize: [2, 2], strides: [2, 2]}));
+  
+  // Now we flatten the output from the 2D filters into a 1D vector to prepare
+  // it for input into our last layer. This is common practice when feeding
+  // higher dimensional data to a final classification output layer.
+  model.add(tf.layers.flatten());
+
+  // Our last layer is a dense layer which has 10 output units, one for each
+  // output class (i.e. 0, 1, 2, 3, 4, 5, 6, 7, 8, 9).
+  const NUM_OUTPUT_CLASSES = 10;
+  model.add(tf.layers.dense({
+    units: NUM_OUTPUT_CLASSES,
+    kernelInitializer: 'varianceScaling',
+    activation: 'softmax'
+  }));
+
+  
+  // Choose an optimizer, loss function and accuracy metric,
+  // then compile and return the model
+  const optimizer = tf.train.adam();
+  model.compile({
+    optimizer: optimizer,
+    loss: 'categoricalCrossentropy',
+    metrics: ['accuracy'],
+  });
 
   return model;
 }
 
-/**
- * Convert the input data to tensors that we can use for machine 
- * learning. We will also do the important best practices of _shuffling_
- * the data and _normalizing_ the data
- * MPG on the y-axis.
- */
-function convertToTensor(data) {
-  // Wrapping these calculations in a tidy will dispose any 
-  // intermediate tensors.
+async function train(model, data) {
+  const metrics = ['loss', 'val_loss', 'acc', 'val_acc'];
+  const container = {
+    name: 'Model Training', styles: { height: '1000px' }
+  };
+  const fitCallbacks = tfvis.show.fitCallbacks(container, metrics);
   
-  return tf.tidy(() => {
-    // Step 1. Shuffle the data    
-    tf.util.shuffle(data);
+  const BATCH_SIZE = 512;
+  const TRAIN_DATA_SIZE = 5500;
+  const TEST_DATA_SIZE = 1000;
 
-    // Step 2. Convert data to Tensor
-    const inputs = data.map(d => d.horsepower)
-    const labels = data.map(d => d.mpg);
-
-    const inputTensor = tf.tensor2d(inputs, [inputs.length, 1]);
-    const labelTensor = tf.tensor2d(labels, [labels.length, 1]);
-
-    //Step 3. Normalize the data to the range 0 - 1 using min-max scaling
-    const inputMax = inputTensor.max();
-    const inputMin = inputTensor.min();  
-    const labelMax = labelTensor.max();
-    const labelMin = labelTensor.min();
-
-    const normalizedInputs = inputTensor.sub(inputMin).div(inputMax.sub(inputMin));
-    const normalizedLabels = labelTensor.sub(labelMin).div(labelMax.sub(labelMin));
-
-    return {
-      inputs: normalizedInputs,
-      labels: normalizedLabels,
-      // Return the min/max bounds so we can use them later.
-      inputMax,
-      inputMin,
-      labelMax,
-      labelMin,
-    }
-  });  
-}
-
-async function trainModel(model, inputs, labels) {
-  // Prepare the model for training.  
-  model.compile({
-    optimizer: tf.train.adam(),
-    loss: tf.losses.meanSquaredError,
-    metrics: ['mse'],
+  const [trainXs, trainYs] = tf.tidy(() => {
+    const d = data.nextTrainBatch(TRAIN_DATA_SIZE);
+    return [
+      d.xs.reshape([TRAIN_DATA_SIZE, 28, 28, 1]),
+      d.labels
+    ];
   });
-  
-  const batchSize = 32;
-  const epochs = 50;
-  
-  return await model.fit(inputs, labels, {
-    batchSize,
-    epochs,
+
+  const [testXs, testYs] = tf.tidy(() => {
+    const d = data.nextTestBatch(TEST_DATA_SIZE);
+    return [
+      d.xs.reshape([TEST_DATA_SIZE, 28, 28, 1]),
+      d.labels
+    ];
+  });
+
+  return model.fit(trainXs, trainYs, {
+    batchSize: BATCH_SIZE,
+    validationData: [testXs, testYs],
+    epochs: 10,
     shuffle: true,
-    callbacks: tfvis.show.fitCallbacks(
-      { name: 'Training Performance' },
-      ['loss', 'mse'], 
-      { height: 200, callbacks: ['onEpochEnd'] }
-    )
+    callbacks: fitCallbacks
   });
 }
 
-function testModel(model, inputData, normalizationData) {
-  const {inputMax, inputMin, labelMin, labelMax} = normalizationData;  
-  
-  // Generate predictions for a uniform range of numbers between 0 and 1;
-  // We un-normalize the data by doing the inverse of the min-max scaling 
-  // that we did earlier.
-  const [xs, preds] = tf.tidy(() => {
-    
-    const xs = tf.linspace(0, 1, 100);      
-    const preds = model.predict(xs.reshape([100, 1]));      
-    
-    const unNormXs = xs
-      .mul(inputMax.sub(inputMin))
-      .add(inputMin);
-    
-    const unNormPreds = preds
-      .mul(labelMax.sub(labelMin))
-      .add(labelMin);
-    
-    // Un-normalize the data
-    return [unNormXs.dataSync(), unNormPreds.dataSync()];
-  });
-  
- 
-  const predictedPoints = Array.from(xs).map((val, i) => {
-    return {x: val, y: preds[i]}
-  });
-  
-  const originalPoints = inputData.map(d => ({
-    x: d.horsepower, y: d.mpg,
-  }));
-  
-  
-  tfvis.render.scatterplot(
-    {name: 'Model Predictions vs Original Data'}, 
-    {values: [originalPoints, predictedPoints], series: ['original', 'predicted']}, 
-    {
-      xLabel: 'Horsepower',
-      yLabel: 'MPG',
-      height: 300
-    }
-  );
+const classNames = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine'];
+
+function doPrediction(model, data, testDataSize = 500) {
+  const IMAGE_WIDTH = 28;
+  const IMAGE_HEIGHT = 28;
+  const testData = data.nextTestBatch(testDataSize);
+  const testxs = testData.xs.reshape([testDataSize, IMAGE_WIDTH, IMAGE_HEIGHT, 1]);
+  const labels = testData.labels.argMax([-1]);
+  const preds = model.predict(testxs).argMax([-1]);
+
+  testxs.dispose();
+  return [preds, labels];
+}
+
+
+async function showAccuracy(model, data) {
+  const [preds, labels] = doPrediction(model, data);
+  const classAccuracy = await tfvis.metrics.perClassAccuracy(labels, preds);
+  const container = {name: 'Accuracy', tab: 'Evaluation'};
+  tfvis.show.perClassAccuracy(container, classAccuracy, classNames);
+
+  labels.dispose();
+}
+
+async function showConfusion(model, data) {
+  const [preds, labels] = doPrediction(model, data);
+  const confusionMatrix = await tfvis.metrics.confusionMatrix(labels, preds);
+  const container = {name: 'Confusion Matrix', tab: 'Evaluation'};
+  tfvis.render.confusionMatrix(
+      container, {values: confusionMatrix}, classNames);
+
+  labels.dispose();
 }
